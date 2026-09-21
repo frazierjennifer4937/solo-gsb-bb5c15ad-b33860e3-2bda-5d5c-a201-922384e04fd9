@@ -13,6 +13,74 @@
 计算以**异步任务**方式执行：先创建任务拿到 ID，再按 ID 轮询结果；任务状态与
 结果持久化在 SQLite 中（容器启动时自动建库建表）。
 
+## 船队协同任务（`POST /fleet-tasks`）
+
+单船之外，还可以一次性提交**一队船舶**（各自的名称、吃水、富余水深、航程时长），
+共享同一份潮位样本、查询区间、最大采样间隔与封航区间。后台为每艘船分别计算安全
+通航窗口与出发窗口，再取**全队公共出发区间**——在该区间内任意时刻出发，每艘船的
+占用区间 `[t, t+各自航程)` 都能全程落在**各自的**安全窗口内。
+
+- 各船结果见 `result.ships[]`（`name`、`threshold_m`、`windows`、`unknown`、
+  `departure_windows`，字段含义与单船结果相同）；
+- 公共出发区间见 `result.common_departure_windows[]`，即各船出发窗口的交集；
+- 导致公共区间被排除的区段见 `result.exclusions[]`，每段给出 `start` / `end` /
+  `duration_seconds`、`reason` 与 `ships`：
+  - `reason = ship_constraint`：`ships` 列出在该区段无法出发的船名（按请求顺序）；
+  - `reason = maintenance_closure` 或 `unknown_sample_segment`：全队共享的封航 /
+    未知采样段约束，`ships` 为空数组。封航与未知段按**全队约束**处理：以队中
+    **最长航程**整体向前平移后扣除（最慢的船决定全队能走的时刻），端点相接的
+    整点出发仍允许。
+
+`POST /fleet-tasks` → `201` 立即返回任务 ID，`GET /fleet-tasks/{task_id}` 轮询
+（`pending` / `done` / `failed`，不存在返回 `404`），模式与单船任务完全一致，
+结果持久化在 SQLite 的 `fleet_tasks` 表中。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `ships` | 数组（≥1） | 船舶参数 `[{"name", "draft_m", "clearance_m", "transit_duration_seconds"}]`；船名非空白且队内需唯一，航程必填且 > 0 |
+| `samples` | 数组（≥2） | 全队共享的潮位样本，按 UTC 时间**严格递增** |
+| `query_start` / `query_end` | datetime | 查询起止时间（UTC） |
+| `max_gap_seconds` | number > 0 | 相邻样本最大允许间隔（秒），全队约束 |
+| `maintenance_blocks` | 数组，可选 | 全队共享的封航区间 `[{"start", "end"}]`，裁剪到查询范围并合并 |
+
+```bash
+curl -X POST http://localhost:8000/fleet-tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ships": [
+      {"name": "甲轮", "draft_m": 4.0, "clearance_m": 1.0, "transit_duration_seconds": 1800},
+      {"name": "乙轮", "draft_m": 5.0, "clearance_m": 1.0, "transit_duration_seconds": 1800}
+    ],
+    "samples": [
+      {"time": "2026-09-21T00:00:00Z", "height_m": 1.0},
+      {"time": "2026-09-21T01:00:00Z", "height_m": 3.0},
+      {"time": "2026-09-21T02:00:00Z", "height_m": 6.0},
+      {"time": "2026-09-21T03:00:00Z", "height_m": 8.0},
+      {"time": "2026-09-21T04:00:00Z", "height_m": 8.0},
+      {"time": "2026-09-21T05:00:00Z", "height_m": 6.0},
+      {"time": "2026-09-21T06:00:00Z", "height_m": 3.0},
+      {"time": "2026-09-21T07:00:00Z", "height_m": 1.0}
+    ],
+    "query_start": "2026-09-21T00:00:00Z",
+    "query_end":   "2026-09-21T07:00:00Z",
+    "max_gap_seconds": 3700,
+    "maintenance_blocks": [
+      {"start": "2026-09-21T03:00:00Z", "end": "2026-09-21T04:00:00Z"}
+    ]
+  }'
+```
+
+上面的请求中，甲轮安全阈值 5 m（安全窗口约 01:39–05:20），乙轮吃水更大、
+阈值 6 m（安全窗口 02:00–05:00）；公共出发区间为 `02:00–02:30` 与 `04:00–04:30`，
+`exclusions` 依次给出：早高峰前仅乙轮水深不足（`ship_constraint`，`ships=["乙轮"]`）、
+封航平移 30 分钟航程后挡出的 `02:30:01–03:59:59`（`maintenance_closure`，`ships=[]`）、
+以及傍晚仅乙轮水深不足的收尾段。
+
+校验失败（船队为空、船名重复或为空白、缺少航程、吃水为负、样本未严格递增、
+封航区间 end 不晚于 start 等）统一返回 `422` 并指明字段与原因。
+
 ## 一条命令启动
 
 前置条件：已安装 Docker 与 Docker Compose 插件（v2）。
@@ -207,11 +275,12 @@ curl -X POST http://localhost:8000/tasks \
 
 ```
 app/
-  main.py            # FastAPI 路由、任务创建/查询、后台计算
+  main.py            # FastAPI 路由、单船/船队任务创建/查询、后台计算
   schemas.py         # 请求/响应模型与输入校验
   config.py          # 配置（TIDE_DB_PATH 等）
-  db.py              # SQLite 连接与启动建表
+  db.py              # SQLite 连接与启动建表（tasks / fleet_tasks）
   services/tides.py  # PCHIP 插值、求根、窗口与 unknown 计算
+  services/fleet.py  # 船队协同：各船窗口、公共出发区间与排除归因
   tests/             # pytest：算法单测 + 接口端到端测试
 Dockerfile           # 依赖安装于构建阶段
 docker-compose.yml   # 一条命令启动，含卷持久化与健康检查

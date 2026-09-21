@@ -12,6 +12,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     error       TEXT,
     created_at  TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS fleet_tasks (
+    task_id     TEXT PRIMARY KEY,
+    status      TEXT NOT NULL CHECK (status IN ('pending', 'done', 'failed')),
+    request     TEXT NOT NULL,
+    result      TEXT,
+    error       TEXT,
+    created_at  TEXT NOT NULL
+);
 """
 
 

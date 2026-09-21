@@ -145,3 +145,176 @@ def test_maintenance_block_end_after_start(client):
         {"start": "2026-09-21T04:00:00Z", "end": "2026-09-21T03:00:00Z"}
     ]
     assert client.post("/tasks", json=payload).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Fleet coordination tasks: POST /fleet-tasks + GET /fleet-tasks/{id}
+# ---------------------------------------------------------------------------
+
+
+def _fleet_payload():
+    return {
+        "ships": [
+            {"name": "甲轮", "draft_m": 4.0, "clearance_m": 1.0,
+             "transit_duration_seconds": 1800},
+            {"name": "乙轮", "draft_m": 4.0, "clearance_m": 1.0,
+             "transit_duration_seconds": 3600},
+        ],
+        "samples": [
+            {"time": f"2026-09-21T{h:02d}:00:00Z", "height_m": h_m}
+            for h, h_m in [
+                (0, 1.0), (1, 3.0), (2, 6.0), (3, 8.0),
+                (4, 8.0), (5, 6.0), (6, 3.0), (7, 1.0),
+            ]
+        ],
+        "query_start": "2026-09-21T00:00:00Z",
+        "query_end": "2026-09-21T07:00:00Z",
+        "max_gap_seconds": 3700,
+        "maintenance_blocks": [
+            {"start": "2026-09-21T03:00:00Z", "end": "2026-09-21T04:00:00Z"}
+        ],
+    }
+
+
+def _poll_fleet(client, payload):
+    resp = client.post("/fleet-tasks", json=payload)
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["status"] in {"pending", "done"}
+    got = client.get(f"/fleet-tasks/{body['task_id']}")
+    assert got.status_code == 200
+    got_body = got.json()
+    assert got_body["status"] == "done", got_body
+    return got_body
+
+
+def test_fleet_create_and_get_task(client):
+    body = _poll_fleet(client, _fleet_payload())
+    result = body["result"]
+
+    # Per-ship results: two ships, request order preserved.
+    assert [s["name"] for s in result["ships"]] == ["甲轮", "乙轮"]
+    assert all(s["threshold_m"] == 5.0 for s in result["ships"])
+    assert all(len(s["windows"]) == 1 for s in result["ships"])
+
+    # Common departure windows: intersection of both ships' windows, i.e.
+    # A's windows shortened by B's longer transit.
+    common = result["common_departure_windows"]
+    assert [(d["start"], d["end"]) for d in common] == [
+        ("2026-09-21T01:39:11Z", "2026-09-21T02:00:00Z"),
+        ("2026-09-21T04:00:00Z", "2026-09-21T04:20:49Z"),
+    ]
+    for d in common:
+        assert d["duration_seconds"] == int(
+            (_parse(d["end"]) - _parse(d["start"])).total_seconds()
+        )
+
+
+def test_fleet_exclusions_identify_ships_and_fleet_constraints(client):
+    result = _poll_fleet(client, _fleet_payload())["result"]
+    by_reason = {}
+    for ex in result["exclusions"]:
+        by_reason.setdefault(ex["reason"], []).append(ex)
+
+    # Closure [03:00,04:00) shifted by the LONGEST transit (1 h) bars fleet
+    # departures on (02:00, 04:00); it is a fleet-wide exclusion with an empty
+    # ship list (cut points 02:00:00 and 04:00:00 remain departable).
+    closure = by_reason["maintenance_closure"]
+    assert len(closure) == 1
+    assert closure[0]["ships"] == []
+    assert closure[0]["start"] == "2026-09-21T02:00:01Z"
+    assert closure[0]["end"] == "2026-09-21T03:59:59Z"
+
+    # B's longer transit rules out the tail of the second window; the first
+    # window is shared because 30 min fits both transits.
+    ship_excl = by_reason["ship_constraint"]
+    assert ship_excl and all(e["ships"] == ["乙轮"] for e in ship_excl)
+    assert ship_excl[0]["start"] == "2026-09-21T04:20:50Z"
+    assert ship_excl[0]["end"] == "2026-09-21T04:50:49Z"
+
+
+def test_fleet_task_not_found(client):
+    assert client.get("/fleet-tasks/doesnotexist").status_code == 404
+
+
+def test_fleet_unknown_sample_segment_is_fleet_constraint(client):
+    payload = _fleet_payload()
+    payload["maintenance_blocks"] = None
+    payload["samples"] = [
+        {"time": "2026-09-21T00:00:00Z", "height_m": 8.0},
+        {"time": "2026-09-21T01:00:00Z", "height_m": 8.0},
+        {"time": "2026-09-21T05:00:00Z", "height_m": 8.0},
+        {"time": "2026-09-21T06:00:00Z", "height_m": 8.0},
+    ]
+    result = _poll_fleet(client, payload)["result"]
+
+    # Windows never span the forbidden gap for any ship.
+    for ship in result["ships"]:
+        assert len(ship["windows"]) == 2
+        reasons = {u["reason"] for u in ship["unknown"]}
+        assert "sample_gap_exceeds_max_gap" in reasons
+    for d in result["common_departure_windows"]:
+        assert d["end"] <= "2026-09-21T02:00:00Z" or \
+            d["start"] >= "2026-09-21T05:00:00Z"
+    unknown_excl = [e for e in result["exclusions"]
+                    if e["reason"] == "unknown_sample_segment"]
+    assert unknown_excl and all(e["ships"] == [] for e in unknown_excl)
+
+
+def test_fleet_no_common_window_when_thresholds_disjoint(client):
+    payload = _fleet_payload()
+    payload["maintenance_blocks"] = None
+    # 乙轮 needs more water than the tide ever provides.
+    payload["ships"][1]["draft_m"] = 9.0
+    result = _poll_fleet(client, payload)["result"]
+
+    assert result["common_departure_windows"] == []
+    assert result["ships"][1]["departure_windows"] == []
+    assert all(
+        ex["ships"] == ["乙轮"]
+        for ex in result["exclusions"]
+        if ex["reason"] == "ship_constraint"
+    )
+
+
+def test_fleet_validation_duplicate_names(client):
+    payload = _fleet_payload()
+    payload["ships"][1]["name"] = payload["ships"][0]["name"]
+    resp = client.post("/fleet-tasks", json=payload)
+    assert resp.status_code == 422
+    assert "唯一" in resp.text
+
+
+def test_fleet_validation_errors(client):
+    base = _fleet_payload()
+
+    def expect_422(mutate):
+        payload = _fleet_payload()
+        mutate(payload)
+        resp = client.post("/fleet-tasks", json=payload)
+        assert resp.status_code == 422, resp.text
+
+    expect_422(lambda p: p["ships"].clear())
+    expect_422(lambda p: p["ships"][0].pop("transit_duration_seconds"))
+    expect_422(lambda p: p["ships"][0].__setitem__("draft_m", -0.5))
+    expect_422(lambda p: p["ships"][0].__setitem__("name", "  "))
+    expect_422(lambda p: p["samples"][3].__setitem__(
+        "time", p["samples"][2]["time"]))
+    expect_422(lambda p: p.__setitem__("query_end", p["query_start"]))
+    expect_422(lambda p: p.__setitem__("max_gap_seconds", 0))
+    expect_422(lambda p: p["maintenance_blocks"].__setitem__(
+        0, {"start": "2026-09-21T05:00:00Z", "end": "2026-09-21T03:00:00Z"}))
+    # The base payload itself is valid (guard against over-broad mutators).
+    assert client.post("/fleet-tasks", json=base).status_code == 201
+
+
+def test_fleet_result_persisted_across_polls(client):
+    payload = _fleet_payload()
+    resp = client.post("/fleet-tasks", json=payload)
+    task_id = resp.json()["task_id"]
+    first = client.get(f"/fleet-tasks/{task_id}").json()
+    second = client.get(f"/fleet-tasks/{task_id}").json()
+    assert first["status"] == second["status"] == "done"
+    assert first["result"] == second["result"]
+    # The stored request round-trips verbatim.
+    assert [s["name"] for s in second["request"]["ships"]] == ["甲轮", "乙轮"]
